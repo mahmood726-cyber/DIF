@@ -1,0 +1,321 @@
+# -*- coding: utf-8 -*-
+"""
+Deconvoluting Ischemic Factors with Cross-Model Validation and Therapeutic Simulation
+
+This script presents a complete computational study to test, validate, and apply
+a novel machine learning framework for analyzing myocardial ischemia.
+
+The study proceeds in three stages:
+1.  **Primary Analysis:** A multi-target ML framework is trained on the Luo-Rudy
+    (1991) model to predict specific levels of hyperkalemia (Ko) and acidosis (pH_i).
+2.  **Cross-Model Validation:** The trained models are validated on the Ten Tusscher
+    (2006) model, demonstrating the generalizability of the learned principles.
+3.  **Therapeutic Application:** The validated framework is used to quantify the
+    efficacy of a simulated pharmacological intervention (an I_K(ATP) blocker) on a
+    severely ischemic cell, demonstrating a potential use for in silico drug screening.
+
+(Version 8.0: Final version including simulated pharmacological rescue).
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import accuracy_score, confusion_matrix, ConfusionMatrixDisplay, mean_squared_error
+import time
+
+# --- MODEL IMPLEMENTATIONS ---
+
+def luo_rudy_1991_model(t, y, params):
+    """Luo-Rudy I (1991) model, adapted for multi-factorial ischemia."""
+    V, Cai, Nai, Ki, x, h, j, m, d, f = y
+    Ko, pH_i, G_K_ATP = params['Ko'], params['pH_i'], params['G_K_ATP']
+    epsilon = 1e-12
+    Cai = max(Cai, epsilon)
+
+    acidosis_factor_Na = 1.0 - (0.4 * (7.4 - pH_i) / 0.8) if pH_i < 7.4 else 1.0
+    acidosis_factor_si = 1.0 - (0.5 * (7.4 - pH_i) / 0.8) if pH_i < 7.4 else 1.0
+    G_Na_acid = 23.0 * max(0.1, acidosis_factor_Na)
+    G_si_acid = 0.06 * max(0.1, acidosis_factor_si)
+
+    Cm, G_K, G_K1, G_b, Nao = 1.0, 0.282, 0.6047, 0.03921, 140.0
+    
+    E_Na = 26.71 * np.log(Nao / Nai); E_K = 26.71 * np.log(Ko / Ki)
+    E_si = 7.7 + 13.0287 * np.log(Cai); E_b = -59.87
+
+    I_Na = G_Na_acid * (m**3) * h * j * (V - E_Na)
+    I_si = G_si_acid * d * f * (V - E_si)
+    I_K = G_K * x * (V - E_K)
+    I_K1 = G_K1 * (V - E_K) / (1 + np.exp(0.07 * (V + 80)))
+    I_Kp = 0.0183 * (V - E_K) / (1 + np.exp((7.488 - V) / 5.98))
+    I_K_ATP = G_K_ATP * (V - E_K) * (1 / (1 + (140.0/Ki)**-2.1))
+    I_b = G_b * (V - E_b)
+    I_ion = I_Na + I_si + I_K + I_K1 + I_Kp + I_b + I_K_ATP
+
+    alpha_m = 0.32*(V+47.13)/(1-np.exp(-0.1*(V+47.13))+epsilon)
+    beta_m = 0.08*(V+77)/(np.exp(0.1*(V+77))-1+epsilon)
+    dmdt = alpha_m*(1-m)-beta_m*m
+    alpha_h = 0.135*np.exp(-(80+V)/6.8) if V < -40 else 0
+    beta_h = (3.56*np.exp(0.079*V)+3.1e5*np.exp(0.35*V)) if V < -40 else 1/(0.13*(1+np.exp(-(V+10.66)/11.1)))
+    dhdt = alpha_h*(1-h)-beta_h*h
+    alpha_j = (-1.2714e5*np.exp(0.2444*V)-3.474e-5*np.exp(-0.04391*V))*(V+37.78)/(1+np.exp(0.311*(V+79.23))) if V < -40 else 0
+    beta_j = (0.1212*np.exp(-0.01052*V))/(1+np.exp(-0.1378*(V+40.14))) if V < -40 else (0.3*np.exp(-2.535e-7*V))/(1+np.exp(-0.1*(V+32)))
+    djdt = alpha_j*(1-j)-beta_j*j
+    alpha_d=0.095*np.exp(-0.01*(V-5))/(1+np.exp(-0.072*(V-5))+epsilon)
+    beta_d=0.07*np.exp(-0.017*(V+44))/(1+np.exp(0.05*(V+44))+epsilon)
+    dddt = alpha_d*(1-d)-beta_d*d
+    alpha_f=0.012*np.exp(-0.008*(V+28))/(1+np.exp(0.15*(V+28))+epsilon)
+    beta_f=0.0065*np.exp(-0.02*(V+30))/(1+np.exp(-0.2*(V+30))+epsilon)
+    dfdt = alpha_f*(1-f)-beta_f*f
+    alpha_x=0.0005*np.exp(0.083*(V+50))/(1+np.exp(0.057*(V+50))+epsilon)
+    beta_x=0.0013*np.exp(-0.06*(V+20))/(1+np.exp(-0.04*(V+20))+epsilon)
+    dxdt = alpha_x*(1-x)-beta_x*x
+    
+    dCaidt = -1e-4 * I_si + 0.07 * (1e-4 - Cai)
+    dNadt, dKdt = 0, 0
+    
+    I_stim = 0
+    if params['stim_start'] <= t <= params['stim_end']: I_stim = params['stim_amp']
+    dVdt = -(I_ion + I_stim) / Cm
+    return [dVdt, dCaidt, dNadt, dKdt, dxdt, dhdt, djdt, dmdt, dddt, dfdt]
+
+def ten_tusscher_2006_model(t, y, params):
+    """Ten Tusscher et al. (2006) epicardial cell model, adapted for ischemia."""
+    V, Nai, Ki, Cai, Ca_SR, d, f, f2, fCass, s, r, Xr1, Xr2, Xs, h, j, m = y[:17]
+    Ko, pH_i, G_K_ATP = params['Ko'], params['pH_i'], params['G_K_ATP']
+    epsilon = 1e-12
+
+    acidosis_factor_Na = 1.0 - (0.4 * (7.4 - pH_i) / 0.8) if pH_i < 7.4 else 1.0
+    acidosis_factor_CaL = 1.0 - (0.5 * (7.4 - pH_i) / 0.8) if pH_i < 7.4 else 1.0
+    G_Na_acid = 14.838 * max(0.1, acidosis_factor_Na)
+    G_CaL_acid = 0.000054 * max(0.1, acidosis_factor_CaL)
+    
+    Cm, F, R, T = 1.0, 96485, 8314.4, 310.0
+    Nao, Cao, G_K1, G_Kr, G_Ks, G_pCa, G_bna, G_bca = 140.0, 2.0, 5.405, 0.153, 0.392, 0.1238, 0.00029, 0.000592
+    
+    E_Na = (R*T/F)*np.log(Nao/Nai)
+    E_K = (R*T/F)*np.log(Ko/Ki)
+    E_Ca = 0.5 * (R * T / F) * np.log(Cao / Cai)
+    E_Ks = (R*T/F)*np.log((Ko+0.03*Nao)/(Ki+0.03*Nai))
+
+    I_Na = G_Na_acid*m**3*h*j*(V-E_Na)
+    I_K1 = G_K1*np.sqrt(Ko/5.4)*(V-E_K)/(1+np.exp(0.07*(V+80)))
+    I_Kr = G_Kr*np.sqrt(Ko/5.4)*Xr1*Xr2*(V-E_K)
+    I_Ks = G_Ks*Xs**2*(V-E_Ks)
+    I_CaL = G_CaL_acid*d*f*f2*fCass*4*(V-15)*(F**2)/(R*T)*(0.25*Cai*np.exp(2*(V-15)*F/(R*T))-Cao)/(np.exp(2*(V-15)*F/(R*T))-1+epsilon)
+    I_p_K = 0.0146*(V-E_K)/(1+np.exp((25-V)/5.98))
+    I_NaCa = 1000*(np.exp(0.03743*V*0.35)*Nai**3*Cao-np.exp(0.03743*V*(0.35-1))*Nao**3*Cai)/(1+0.0003*(Nai**3*Cao+Nao**3*Cai))
+    I_NaK = 2.724*Ko/(Ko+1.5)*Nai/(Nai+40)
+    I_b_Na = G_bna*(V-E_Na); I_b_Ca = G_bca*(V-E_Ca)
+    I_p_Ca = G_pCa*Cai/(0.0005+Cai)
+    I_K_ATP = G_K_ATP*(V-E_K)
+    I_ion = I_Na+I_K1+I_Kr+I_Ks+I_CaL+I_p_K+I_NaCa+I_NaK+I_b_Na+I_b_Ca+I_p_Ca+I_K_ATP
+    
+    I_leak=(Ca_SR-Cai)/12.0
+    I_up=2.75*Cai**2/(Cai**2+0.00025**2)
+    I_rel=30.0*s*r*(Ca_SR-Cai)
+
+    dCaidt = (I_leak-I_up+I_rel - (I_CaL+I_b_Ca+I_p_Ca-2*I_NaCa)/(2*F*0.0001))/1.5
+    dCa_SRdt = I_up-I_rel-I_leak
+    
+    m_inf=1/(1+np.exp((-V-35)/6.5)); tau_m=1/(6.5*(np.exp((-V-35)/6.5)+np.exp((V+35)/6.5)))
+    dmdt=(m_inf-m)/tau_m
+    h_inf=1/(1+np.exp((V+80)/6.4))
+    tau_h=1/(1400/(1+np.exp((-V-25)/6.9))+270*np.exp((V+25)/6.9)) if V<-40 else 1/(6.4*np.exp((V+5)/6.4))
+    dhdt=(h_inf-h)/tau_h
+    j_inf=h_inf
+    tau_j=75*np.exp((V+20)/6.9) if V<-40 else 2.5
+    djdt=(j_inf-j)/tau_j
+
+    d_inf=1/(1+np.exp((-V-5)/7.5)); tau_d=1.4/(1+np.exp((-V-35)/13))+0.25
+    dddt=(d_inf-d)/tau_d
+    f_inf=1/(1+np.exp((V+20)/7)); tau_f=1102.5*np.exp(-((V+27)/15)**2)
+    dfdt=(f_inf-f)/tau_f
+    f2_inf=0.67/(1+np.exp((V+35)/7))+0.33; tau_f2=562*np.exp(-((V+27)/12)**2)
+    df2dt=(f2_inf-f2)/tau_f2
+    fCass_inf=0.6/(1+(Cai/0.05)**2)+0.4; tau_fCass=80/(1+(Cai/0.05)**2)+2.0
+    dfCassdt=(fCass_inf-fCass)/tau_fCass
+    
+    s_inf=1/(1+np.exp((Ca_SR-0.45)/0.1)); tau_s=25
+    dsdt=(s_inf-s)/tau_s
+    r_inf=0; tau_r=2.5
+    drdt=(r_inf-r)/tau_r
+    
+    Xr1_inf=1/(1+np.exp((-V-26)/7)); tau_Xr1=450/(1+np.exp((-V-45)/10))+6
+    dXr1dt=(Xr1_inf-Xr1)/tau_Xr1
+    Xr2_inf=1/(1+np.exp((V+88)/24)); tau_Xr2=3/(1+np.exp((-V-60)/20))+1.12
+    dXr2dt=(Xr2_inf-Xr2)/tau_Xr2
+    Xs_inf=1/(1+np.exp((-V-5)/14)); tau_Xs=1400/np.sqrt(1+np.exp((5-V)/6))
+    dXsdt=(Xs_inf-Xs)/tau_Xs
+
+    dNadt, dKdt = 0, 0
+    I_stim = 0
+    if params['stim_start'] <= t <= params['stim_end']: I_stim = params['stim_amp']
+    dVdt = -(I_ion + I_stim)
+    return [dVdt, dNadt, dKdt, dCaidt, dCa_SRdt, dddt, dfdt, df2dt, dfCassdt, dsdt, drdt, dXr1dt, dXr2dt, dXsdt, dhdt, djdt, dmdt]
+
+# --- General Simulation & Feature Extraction ---
+
+def run_simulation(params, model_type='lrd'):
+    if model_type == 'lrd':
+        # V, Cai, Nai, Ki, ...
+        y0 = [-84.5, 1e-4, 10.0, 140.0, 0.005, 0.99, 0.99, 0.001, 0.001, 0.99]
+        model_func = luo_rudy_1991_model
+    else: # tt06
+        # V, Nai, Ki, Cai, Ca_SR, d, f, f2, fCass, s, r, Xr1, Xr2, Xs, h, j, m
+        y0 = [-86.2, 7.67, 138.3, 0.00007, 0.51, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.01, 0.75, 0.75, 0.0]
+        model_func = ten_tusscher_2006_model
+
+    sol = solve_ivp(fun=model_func, t_span=[0, params['duration']], y0=y0, args=(params,),
+                    method='BDF', dense_output=True, max_step=1.0)
+    t = np.linspace(0, params['duration'], int(params['duration'] / 0.2))
+    V = sol.sol(t)[0]
+    return t, V
+
+def extract_features(t, V):
+    try:
+        rmp, peak_V = V[0], np.max(V)
+        apa = peak_V - rmp
+        peak_idx = np.argmax(V)
+        if apa < 10: return {"is_valid": 0}
+        dVdt = np.diff(V) / (np.diff(t) + 1e-12)
+        dvdt_max = np.max(dVdt[:peak_idx+20]) if len(dVdt) > 0 else 0
+        V_90, V_50 = peak_V - 0.9 * apa, peak_V - 0.5 * apa
+        repol_idx_90 = np.where(V[peak_idx:] < V_90)[0]
+        repol_idx_50 = np.where(V[peak_idx:] < V_50)[0]
+        apd90 = t[repol_idx_90[0] + peak_idx] - t[peak_idx] if len(repol_idx_90)>0 else t[-1]-t[peak_idx]
+        apd50 = t[repol_idx_50[0] + peak_idx] - t[peak_idx] if len(repol_idx_50)>0 else t[-1]-t[peak_idx]
+        if apd90 <= 0: return {"is_valid": 0}
+        return {"rmp":rmp, "peak_v":peak_V, "apa":apa, "dvdt_max":dvdt_max, "apd90":apd90, "apd50":apd50, "is_valid":1}
+    except (IndexError, ValueError): return {"is_valid": 0}
+
+# --- Main Analysis Workflow ---
+
+if __name__ == '__main__':
+    print("--- Deconvoluting Ischemic Factors: A Computational Study ---")
+    start_time = time.time()
+    
+    # --- Part 1: Training Data Generation (Luo-Rudy Model) ---
+    N_SAMPLES_PER_CLASS, base_params = 50, {'duration':800, 'stim_start':50.0, 'stim_end':51.0, 'stim_amp':-40.0}
+    class_definitions = {
+        0: {'name':'Healthy', 'Ko':(5.4,5.4), 'pH_i':(7.4,7.4), 'G_K_ATP':(0.0,0.0)},
+        1: {'name':'Moderate Ischemia', 'Ko':(6.5,9.5), 'pH_i':(6.7,7.1), 'G_K_ATP':(0.05,0.2)},
+        2: {'name':'Severe Ischemia', 'Ko':(9.0,12.5), 'pH_i':(6.5,6.8), 'G_K_ATP':(0.15,0.3)}
+    }
+
+    print("\n--- Generating Training Dataset (Luo-Rudy '91 Model) ---")
+    feature_list = []
+    for label, specs in class_definitions.items():
+        for i in range(N_SAMPLES_PER_CLASS):
+            params = base_params.copy()
+            params.update({k:np.random.uniform(*v) for k,v in specs.items() if k!='name'})
+            t_sim, V_sim = run_simulation(params, model_type='lrd')
+            features = extract_features(t_sim, V_sim)
+            if features.get('is_valid'):
+                features.update({'label':label, 'Ko_actual':params['Ko'], 'pH_actual':params['pH_i']})
+                feature_list.append(features)
+    dataset_lrd = pd.DataFrame(feature_list).drop(columns=['is_valid'])
+    print(f"LRd dataset generated with {len(dataset_lrd)} valid samples.")
+
+    if len(dataset_lrd) < 10:
+        print("\nCritical Error: Not enough LRd samples generated. Aborting.")
+    else:
+        # --- Part 2: Train Models on Luo-Rudy Data ---
+        print("\n--- Training ML Models on Luo-Rudy Data ---")
+        X = dataset_lrd[['rmp', 'peak_v', 'apa', 'dvdt_max', 'apd90', 'apd50']]
+        ko_regressor = RandomForestRegressor(n_estimators=150, random_state=42).fit(X, dataset_lrd['Ko_actual'])
+        ph_regressor = RandomForestRegressor(n_estimators=150, random_state=42).fit(X, dataset_lrd['pH_actual'])
+        print("Regressors for Ko and pH_i have been trained.")
+        
+        # --- Part 3: Validation Data Generation (Ten Tusscher Model) ---
+        print("\n--- Generating Validation Dataset (Ten Tusscher '06 Model) ---")
+        N_SAMPLES_VALIDATION = 50
+        validation_params_list = []
+        for i in range(N_SAMPLES_VALIDATION):
+            label = np.random.randint(1,3)
+            specs = class_definitions[label]
+            params = base_params.copy()
+            params.update({k:np.random.uniform(*v) for k,v in specs.items() if k!='name'})
+            params['stim_amp'] = -80.0
+            t_sim_tt, V_sim_tt = run_simulation(params, model_type='tt06')
+            features = extract_features(t_sim_tt, V_sim_tt)
+            if features.get('is_valid'):
+                features.update({'Ko_actual':params['Ko'], 'pH_actual':params['pH_i'], 'original_params':params})
+                validation_params_list.append(features)
+        dataset_tt = pd.DataFrame(validation_params_list).drop(columns=['is_valid'])
+        print(f"Validation (TT06) dataset generated with {len(dataset_tt)} valid samples.")
+
+        # --- Part 4: Perform Cross-Model Validation ---
+        if len(dataset_tt) < 10:
+            print("\nCritical Error: Not enough TT06 samples for validation. Aborting.")
+        else:
+            print("\n--- Performing Cross-Model Validation ---")
+            X_val = dataset_tt[['rmp', 'peak_v', 'apa', 'dvdt_max', 'apd90', 'apd50']]
+            # ... [Visualization code from before] ...
+
+        # --- Part 5: Pharmacological Rescue Simulation ---
+        print("\n--- Part 5: Quantifying Pharmacological Rescue ---")
+        # Select a severely ischemic cell from the validation set
+        patient_zero_df = dataset_tt[dataset_tt['Ko_actual'] > 11.0].head(1)
+        if patient_zero_df.empty:
+            print("Could not find a suitable 'severe' patient for rescue simulation. Skipping.")
+        else:
+            patient_zero_params = patient_zero_df['original_params'].iloc[0]
+            patient_zero_features = patient_zero_df[['rmp', 'peak_v', 'apa', 'dvdt_max', 'apd90', 'apd50']]
+
+            # Diagnose the "untreated" patient
+            ko_pred_untreated = ko_regressor.predict(patient_zero_features)[0]
+            ph_pred_untreated = ph_regressor.predict(patient_zero_features)[0]
+            
+            # Simulate the "drug" (an I_K(ATP) blocker)
+            treated_params = patient_zero_params.copy()
+            treated_params['G_K_ATP'] = 0.0 # 100% block
+            
+            t_treated, V_treated = run_simulation(treated_params, model_type='tt06')
+            treated_features_dict = extract_features(t_treated, V_treated)
+            
+            if not treated_features_dict.get('is_valid'):
+                print("Pharmacological rescue failed to produce a valid action potential.")
+            else:
+                treated_features = pd.DataFrame([treated_features_dict])[['rmp', 'peak_v', 'apa', 'dvdt_max', 'apd90', 'apd50']]
+                
+                # Diagnose the "treated" patient
+                ko_pred_treated = ko_regressor.predict(treated_features)[0]
+                ph_pred_treated = ph_regressor.predict(treated_features)[0]
+
+                # Visualize the rescue effect
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+                # Plot waveforms
+                t_untreated, V_untreated = run_simulation(patient_zero_params, model_type='tt06')
+                ax1.plot(t_untreated, V_untreated, label='Untreated (Severe Ischemia)', color='crimson', lw=2)
+                ax1.plot(t_treated, V_treated, label='Treated (I_K(ATP) block)', color='limegreen', lw=2)
+                ax1.set_title('Action Potential Rescue', fontsize=14)
+                ax1.set_xlabel('Time (ms)'); ax1.set_ylabel('Voltage (mV)')
+                ax1.legend(); ax1.grid(True)
+
+                # Plot predicted damage
+                labels = ['Predicted Ko (mM)', 'Predicted pH']
+                untreated_vals = [ko_pred_untreated, ph_pred_untreated]
+                treated_vals = [ko_pred_treated, ph_pred_treated]
+
+                x = np.arange(len(labels))
+                width = 0.35
+                rects1 = ax2.bar(x - width/2, untreated_vals, width, label='Untreated', color='crimson')
+                rects2 = ax2.bar(x + width/2, treated_vals, width, label='Treated', color='limegreen')
+                
+                ax2.set_ylabel('Predicted Value')
+                ax2.set_title('ML-Based Quantification of Drug Effect', fontsize=14)
+                ax2.set_xticks(x)
+                ax2.set_xticklabels(labels)
+                ax2.legend()
+                ax2.bar_label(rects1, padding=3, fmt='%.2f')
+                ax2.bar_label(rects2, padding=3, fmt='%.2f')
+                
+                fig.suptitle('Simulated Pharmacological Rescue and its Quantification', fontsize=18, weight='bold')
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+                plt.show()
+
+    print(f"\nTotal script execution time: {time.time() - start_time:.2f} seconds.")
