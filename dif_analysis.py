@@ -17,14 +17,15 @@ The study proceeds in three stages:
 (Version 8.0: Final version including simulated pharmacological rescue).
 """
 
+import time
+
 import numpy as np
 import pandas as pd
 from scipy.integrate import solve_ivp
+import matplotlib
+matplotlib.use('Agg')  # headless backend; must be set before importing pyplot
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, confusion_matrix, ConfusionMatrixDisplay, mean_squared_error
-import time
+from sklearn.ensemble import RandomForestRegressor
 
 # --- MODEL IMPLEMENTATIONS ---
 
@@ -193,7 +194,7 @@ def extract_features(t, V):
 
 # --- Main Analysis Workflow ---
 
-if __name__ == '__main__':
+def main():
     print("--- Deconvoluting Ischemic Factors: A Computational Study ---")
     start_time = time.time()
     
@@ -316,6 +317,13 @@ if __name__ == '__main__':
                 
                 fig.suptitle('Simulated Pharmacological Rescue and its Quantification', fontsize=18, weight='bold')
                 plt.tight_layout(rect=[0, 0, 1, 0.95])
-                plt.show()
+                out_png = 'pharmacological_rescue.png'
+                fig.savefig(out_png, dpi=120)
+                plt.close(fig)
+                print(f"Saved rescue figure to {out_png}")
 
     print(f"\nTotal script execution time: {time.time() - start_time:.2f} seconds.")
+
+
+if __name__ == '__main__':
+    main()

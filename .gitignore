@@ -19,6 +19,9 @@ __pycache__/
 .venv/
 venv/
 
+# Regenerated figure output (produced by `python dif_analysis.py`)
+pharmacological_rescue.png
+
 # OS/editor files
 .DS_Store
 Thumbs.db
